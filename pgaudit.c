@@ -1006,9 +1006,7 @@ log_select_dml(Oid auditOid, List *rangeTabls)
         if (!auditLogCatalog && IsSystemNamespace(relNamespaceOid))
             continue;
 
-        relname = RelationGetRelationName(rel);
         if (ignoreTableName != NULL && 0 == strcmp(ignoreTableName, get_rel_name(relOid))) {
-            relation_close(rel, NoLock);
             continue;
         }
 
