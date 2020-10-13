@@ -5,7 +5,7 @@
  * object level logging, and fully-qualified object names for all DML and DDL
  * statements where possible (See README.md for details).
  *
- * Copyright (c) 2014-2019, PostgreSQL Global Development Group
+ * Copyright (c) 2014-2020, PostgreSQL Global Development Group
  *------------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -148,12 +148,6 @@ bool auditLogStatementOnce = false;
  * determine if a statement should be logged.
  */
 char *auditRole = NULL;
-
-/**
- * GUC variable for pgaudit.log_ignore_table
- * Sepecifies which table will be ignored in audit logfile
- */
-char *ignoreTableName = NULL;
 
 /*
  * String constants for the audit log fields.
@@ -968,7 +962,6 @@ log_select_dml(Oid auditOid, List *rangeTabls)
     ListCell *lr;
     bool first = true;
     bool found = false;
-    char *relname;
 
     /* Do not log if this is an internal statement */
     if (internalStatement)
@@ -977,7 +970,7 @@ log_select_dml(Oid auditOid, List *rangeTabls)
     foreach(lr, rangeTabls)
     {
         Oid relOid;
-        Relation rel;
+        Oid relNamespaceOid;
         RangeTblEntry *rte = lfirst(lr);
 
         /* We only care about tables, and can ignore subqueries etc. */
@@ -1000,19 +993,10 @@ log_select_dml(Oid auditOid, List *rangeTabls)
          * false) then filter out any system relations here.
          */
         relOid = rte->relid;
-        rel = relation_open(relOid, NoLock);
+        relNamespaceOid = get_rel_namespace(relOid);
 
-        if (!auditLogCatalog && IsSystemNamespace(RelationGetNamespace(rel)))
-        {
-            relation_close(rel, NoLock);
+        if (!auditLogCatalog && IsSystemNamespace(relNamespaceOid))
             continue;
-        }
-        
-        relname = RelationGetRelationName(rel);
-        if (ignoreTableName != NULL && 0 == strcmp(ignoreTableName, relname)) {
-            relation_close(rel, NoLock);
-            continue;
-        }
 
         /*
          * Default is that this was not through a grant, to support session
@@ -1109,10 +1093,8 @@ log_select_dml(Oid auditOid, List *rangeTabls)
 
         /* Get a copy of the relation name and assign it to object name */
         auditEventStack->auditEvent.objectName =
-            quote_qualified_identifier(get_namespace_name(
-                                           RelationGetNamespace(rel)),
-                                       RelationGetRelationName(rel));
-        relation_close(rel, NoLock);
+            quote_qualified_identifier(
+                get_namespace_name(relNamespaceOid), get_rel_name(relOid));
 
         /* Perform object auditing only if the audit role is valid */
         if (auditOid != InvalidOid)
@@ -1375,8 +1357,27 @@ pgaudit_ProcessUtility_hook(Node *parsetree,
         /* Process top level utility statement */
         if (context == PROCESS_UTILITY_TOPLEVEL)
         {
+            /*
+             * If the stack is not empty then the only allowed entries are open
+             * select, show, and explain cursors
+             */
             if (auditEventStack != NULL)
-                elog(ERROR, "pgaudit stack is not empty");
+            {
+                AuditEventStackItem *nextItem = auditEventStack;
+
+                do
+                {
+                    if (nextItem->auditEvent.commandTag != T_SelectStmt &&
+                        nextItem->auditEvent.commandTag != T_VariableShowStmt &&
+                        nextItem->auditEvent.commandTag != T_ExplainStmt)
+                    {
+                        elog(ERROR, "pgaudit stack is not empty");
+                    }
+
+                    nextItem = nextItem->next;
+                }
+                while (nextItem != NULL);
+            }
 
             stackItem = stack_push();
             stackItem->auditEvent.paramList = copyParamList(params);
@@ -1398,6 +1399,19 @@ pgaudit_ProcessUtility_hook(Node *parsetree,
             stackItem->auditEvent.commandTag == T_DoStmt &&
             !IsAbortedTransactionBlockState())
             log_audit_event(stackItem);
+
+        /*
+         * A close will free the open cursor which will also free the close
+         * audit entry. Immediately log the close and set stackItem to NULL so
+         * it won't be logged later.
+         */
+        if (stackItem->auditEvent.commandTag == T_ClosePortalStmt)
+        {
+            if (auditLogBitmap & LOG_MISC && !IsAbortedTransactionBlockState())
+                log_audit_event(stackItem);
+
+            stackItem = NULL;
+        }
     }
 
     /* Call the standard process utility chain. */
@@ -1969,17 +1983,6 @@ _PG_init(void)
         GUC_NOT_IN_SAMPLE,
         NULL, NULL, NULL);
 
-    /* Define pgaudit.log_ignore_table */
-    DefineCustomStringVariable(
-        "pgaudit.log_ignore_table",
-        "Sepecifies which table should be ignored in audit logfile",
-        NULL,
-        &ignoreTableName,
-        "",
-        PGC_SUSET,
-        GUC_NOT_IN_SAMPLE,
-        NULL, NULL, NULL);
-    
     /*
      * Install our hook functions after saving the existing pointers to
      * preserve the chains.
