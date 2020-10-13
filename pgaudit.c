@@ -5,7 +5,7 @@
  * object level logging, and fully-qualified object names for all DML and DDL
  * statements where possible (See README.md for details).
  *
- * Copyright (c) 2014-2019, PostgreSQL Global Development Group
+ * Copyright (c) 2014-2020, PostgreSQL Global Development Group
  *------------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -977,7 +977,7 @@ log_select_dml(Oid auditOid, List *rangeTabls)
     foreach(lr, rangeTabls)
     {
         Oid relOid;
-        Relation rel;
+        Oid relNamespaceOid;
         RangeTblEntry *rte = lfirst(lr);
 
         /* We only care about tables, and can ignore subqueries etc. */
@@ -1000,13 +1000,10 @@ log_select_dml(Oid auditOid, List *rangeTabls)
          * false) then filter out any system relations here.
          */
         relOid = rte->relid;
-        rel = relation_open(relOid, NoLock);
+        relNamespaceOid = get_rel_namespace(relOid);
 
-        if (!auditLogCatalog && IsSystemNamespace(RelationGetNamespace(rel)))
-        {
-            relation_close(rel, NoLock);
+        if (!auditLogCatalog && IsSystemNamespace(relNamespaceOid))
             continue;
-        }
 
         relname = RelationGetRelationName(rel);
         if (ignoreTableName != NULL && 0 == strcmp(ignoreTableName, relname)) {
@@ -1071,10 +1068,12 @@ log_select_dml(Oid auditOid, List *rangeTabls)
         switch (rte->relkind)
         {
             case RELKIND_RELATION:
+            case RELKIND_PARTITIONED_TABLE:
                 auditEventStack->auditEvent.objectType = OBJECT_TYPE_TABLE;
                 break;
 
             case RELKIND_INDEX:
+            case RELKIND_PARTITIONED_INDEX:
                 auditEventStack->auditEvent.objectType = OBJECT_TYPE_INDEX;
                 break;
 
@@ -1109,10 +1108,8 @@ log_select_dml(Oid auditOid, List *rangeTabls)
 
         /* Get a copy of the relation name and assign it to object name */
         auditEventStack->auditEvent.objectName =
-            quote_qualified_identifier(get_namespace_name(
-                                           RelationGetNamespace(rel)),
-                                       RelationGetRelationName(rel));
-        relation_close(rel, NoLock);
+            quote_qualified_identifier(
+                get_namespace_name(relNamespaceOid), get_rel_name(relOid));
 
         /* Perform object auditing only if the audit role is valid */
         if (auditOid != InvalidOid)
@@ -1376,8 +1373,27 @@ pgaudit_ProcessUtility_hook(PlannedStmt *pstmt,
         /* Process top level utility statement */
         if (context == PROCESS_UTILITY_TOPLEVEL)
         {
+            /*
+             * If the stack is not empty then the only allowed entries are open
+             * select, show, and explain cursors
+             */
             if (auditEventStack != NULL)
-                elog(ERROR, "pgaudit stack is not empty");
+            {
+                AuditEventStackItem *nextItem = auditEventStack;
+
+                do
+                {
+                    if (nextItem->auditEvent.commandTag != T_SelectStmt &&
+                        nextItem->auditEvent.commandTag != T_VariableShowStmt &&
+                        nextItem->auditEvent.commandTag != T_ExplainStmt)
+                    {
+                        elog(ERROR, "pgaudit stack is not empty");
+                    }
+
+                    nextItem = nextItem->next;
+                }
+                while (nextItem != NULL);
+            }
 
             stackItem = stack_push();
             stackItem->auditEvent.paramList = copyParamList(params);
@@ -1399,6 +1415,19 @@ pgaudit_ProcessUtility_hook(PlannedStmt *pstmt,
             stackItem->auditEvent.commandTag == T_DoStmt &&
             !IsAbortedTransactionBlockState())
             log_audit_event(stackItem);
+
+        /*
+         * A close will free the open cursor which will also free the close
+         * audit entry. Immediately log the close and set stackItem to NULL so
+         * it won't be logged later.
+         */
+        if (stackItem->auditEvent.commandTag == T_ClosePortalStmt)
+        {
+            if (auditLogBitmap & LOG_MISC && !IsAbortedTransactionBlockState())
+                log_audit_event(stackItem);
+
+            stackItem = NULL;
+        }
     }
 
     /* Call the standard process utility chain. */
