@@ -968,7 +968,6 @@ log_select_dml(Oid auditOid, List *rangeTabls)
     ListCell *lr;
     bool first = true;
     bool found = false;
-    char *relname;
 
 
     /* Do not log if this is an internal statement */
@@ -1006,8 +1005,7 @@ log_select_dml(Oid auditOid, List *rangeTabls)
         if (!auditLogCatalog && IsSystemNamespace(relNamespaceOid))
             continue;
 
-        relname = RelationGetRelationName(rel);
-        if (ignoreTableName != NULL && 0 == strcmp(ignoreTableName, relname)) {
+        if (ignoreTableName != NULL && 0 == strcmp(ignoreTableName, get_rel_name(relOid))) {
             relation_close(rel, NoLock);
             continue;
         }
